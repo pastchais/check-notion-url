@@ -1,0 +1,43 @@
+# 工作流名称
+name: Check Notion Links
+
+# 触发器：定义何时运行此工作流
+on:
+  # 1. 定时触发：使用 cron 语法
+  schedule:
+    # 每天 UTC 时间 1:00 AM 运行 (对应北京时间早上 9:00 AM)
+    # 你可以根据需要修改时间，例如 '0 22 * * *' 表示北京时间早上6点
+    - cron: '0 1 * * *'
+  
+  # 2. 手动触发：允许你在 GitHub Actions 页面手动点击运行
+  workflow_dispatch:
+
+# 任务：定义需要执行的具体工作
+jobs:
+  check-links:
+    # 运行环境：使用最新的 Ubuntu 系统
+    runs-on: ubuntu-latest
+
+    # 步骤：按顺序执行的命令
+    steps:
+      # 第一步：检出（下载）你的仓库代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 第二步：设置 Node.js 环境
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # 使用 Node.js 20 版本
+
+      # 第三步：安装脚本所需的依赖库
+      - name: Install dependencies
+        run: npm install @notionhq/client axios
+
+      # 第四步：运行你的检查脚本
+      - name: Run link checker script
+        # 将我们设置的 Secrets 作为环境变量传递给脚本
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: node check_urls.js
