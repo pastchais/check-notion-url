@@ -1,6 +1,7 @@
 // 引入所需的库
 const { Client } = require("@notionhq/client");
 const playwright = require("playwright");
+const pLimit = require("p-limit");
 
 // 从 GitHub Secrets 获取 Notion API 密钥和数据库 ID
 const notionApiKey = process.env.NOTION_API_KEY;
@@ -8,6 +9,10 @@ const databaseId = process.env.NOTION_DATABASE_ID;
 
 // 初始化 Notion 客户端
 const notion = new Client({ auth: notionApiKey });
+
+// --- [OPTIMIZATION] ---
+// 设置并发限制，5 是一个在 GitHub Actions 环境中稳定运行的推荐值
+const limit = pLimit(5);
 
 // 状态映射
 const STATUS_MAP = {
@@ -27,22 +32,18 @@ async function checkUrlStatus(browser, url) {
   if (!url) {
     return STATUS_MAP.error;
   }
-
   let page;
   try {
     page = await browser.newPage({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     });
-
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    
     const finalUrl = page.url();
     const status = response.status();
 
     if (finalUrl !== url && finalUrl !== url + '/') {
       return STATUS_MAP.redirect;
     }
-    
     if (status >= 200 && status < 400) {
       return STATUS_MAP.available;
     } else if (status === 404) {
@@ -50,7 +51,6 @@ async function checkUrlStatus(browser, url) {
     } else {
       return STATUS_MAP.error;
     }
-
   } catch (error) {
     console.error(`🔴 检查 "${url}" 时发生 Playwright 错误: ${error.message}`);
     if (error.message.includes('404')) {
@@ -65,23 +65,36 @@ async function checkUrlStatus(browser, url) {
 }
 
 /**
- * 更新 Notion 页面
- * @param {string} pageId - Notion 页面的 ID
- * @param {string} newStatus - 新的状态
+ * [REFACTORED] 将检查和更新的完整流程封装成一个函数
+ * @param {object} pageInfo - Notion 页面对象
+ * @param {import('playwright').Browser} browser - Playwright 浏览器实例
  */
-async function updateNotionPage(pageId, newStatus) {
+async function processPage(pageInfo, browser) {
+  const pageId = pageInfo.id;
+  const title = pageInfo.properties.名称.title[0]?.plain_text || "无标题";
+  const url = pageInfo.properties.链接.url;
+
+  if (!url) {
+    console.log(`⏭️  跳过: "${title}"，因为链接为空。`);
+    return;
+  }
+
+  console.log(`--- 开始检查: "${title}" (${url}) ---`);
+  const status = await checkUrlStatus(browser, url);
+  
+  // 更新 Notion 数据库
   try {
     await notion.pages.update({
       page_id: pageId,
       properties: {
         '状态': {
-          status: { name: newStatus },
+          status: { name: status },
         },
       },
     });
-    console.log(`✅ [${pageId}] 更新成功，新状态: ${newStatus}`);
+    console.log(`✅ [${title}] 更新成功，新状态: ${status}`);
   } catch (error) {
-    console.error(`❌ [${pageId}] 更新 Notion 页面失败:`, error.body || error);
+    console.error(`❌ [${title}] 更新 Notion 页面失败:`, error.body || error);
   }
 }
 
@@ -89,55 +102,40 @@ async function updateNotionPage(pageId, newStatus) {
  * 主函数
  */
 async function main() {
-  console.log("🚀 开始执行链接检查任务 (Playwright 健壮模式 - 全面检查)...");
+  console.log("🚀 开始执行链接检查任务 (Playwright 并行模式)...");
   
   const browser = await playwright.chromium.launch();
   
   try {
-    // --- [MODIFIED] ---
-    // 通过循环和分页，获取数据库中的所有页面，而不再进行过滤
     let allPages = [];
     let nextCursor = undefined;
-    
     console.log("正在获取数据库中的所有链接...");
-
     do {
       const response = await notion.databases.query({
         database_id: databaseId,
-        start_cursor: nextCursor, // 使用 start_cursor 进行分页
+        start_cursor: nextCursor,
       });
-
       allPages.push(...response.results);
       nextCursor = response.next_cursor;
-
-    } while (nextCursor); // 如果还有下一页，则继续循环
+    } while (nextCursor);
 
     if (allPages.length === 0) {
       console.log("👍 数据库中没有找到任何链接，任务完成。");
-      await browser.close();
       return;
     }
     
-    console.log(`🔍 共找到 ${allPages.length} 个链接进行全面检查。`);
+    console.log(`🔍 共找到 ${allPages.length} 个链接，将以 ${limit.activeCount} 的并发数开始检查。`);
 
-    for (const page of allPages) {
-      const pageId = page.id;
-      const title = page.properties.名称.title[0]?.plain_text || "无标题";
-      const url = page.properties.链接.url;
+    // --- [OPTIMIZATION] ---
+    // 创建一个包含所有待处理任务的数组
+    const promises = allPages.map(page => 
+      // 使用 p-limit 来包装我们的处理函数，从而控制并发
+      limit(() => processPage(page, browser))
+    );
+    
+    // 等待所有并发任务完成
+    await Promise.all(promises);
 
-      // 如果链接为空，则跳过检查
-      if (!url) {
-        console.log(`⏭️  跳过: "${title}"，因为链接为空。`);
-        continue;
-      }
-
-      console.log(`--- 开始检查: "${title}" (${url}) ---`);
-      
-      const status = await checkUrlStatus(browser, url);
-      await updateNotionPage(pageId, status);
-
-      await new Promise(resolve => setTimeout(resolve, 1000)); 
-    }
     console.log("🎉 所有链接检查完毕！");
 
   } catch (error) {

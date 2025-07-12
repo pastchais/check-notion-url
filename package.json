@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@notionhq/client": "^2.2.15",
-    "playwright": "^1.44.1"
+    "playwright": "^1.44.1",
+    "p-limit": "^4.0.0"
   }
 }
