@@ -20,7 +20,7 @@ const STATUS_MAP = {
 /**
  * 检查单个 URL 的有效性
  * @param {string} url - 需要检查的 URL
- * @returns {Promise<string>} - 返回链接的状态 (e.g., 'available', 'dead')
+ * @returns {Promise<string>} - 返回链接的状态 (e.g., '可用', '已失效')
  */
 async function checkUrlStatus(url) {
   if (!url) {
@@ -75,7 +75,8 @@ async function updateNotionPage(pageId, newStatus) {
       page_id: pageId,
       properties: {
         '状态': { // 属性名必须与你的 Notion 数据库完全一致
-          select: {
+          // 这里是关键的第二处修改，更新时也需要用 status 关键词
+          status: {
             name: newStatus,
           },
         },
@@ -96,9 +97,10 @@ async function main() {
     // 查询数据库中所有“状态”为“未检测”的页面
     const response = await notion.databases.query({
       database_id: databaseId,
+      // [FIXED] 将 filter 从 select 修改为 status
       filter: {
         property: "状态",
-        select: {
+        status: { // <--- 这里是关键修正！
           equals: "未检测",
         },
       },
@@ -129,7 +131,12 @@ async function main() {
     console.log("🎉 所有链接检查完毕！");
 
   } catch (error) {
-    console.error("❌ 执行主任务时发生严重错误:", error);
+    // 增加对 API 错误的具体日志输出
+    if (error.code) {
+        console.error("❌ 执行主任务时发生 Notion API 错误:", error);
+    } else {
+        console.error("❌ 执行主任务时发生未知错误:", error);
+    }
   }
 }
 
