@@ -1,6 +1,6 @@
 // 引入所需的库
 const { Client } = require("@notionhq/client");
-const axios = require("axios");
+const playwright = require("playwright");
 
 // 从 GitHub Secrets 获取 Notion API 密钥和数据库 ID
 const notionApiKey = process.env.NOTION_API_KEY;
@@ -9,7 +9,7 @@ const databaseId = process.env.NOTION_DATABASE_ID;
 // 初始化 Notion 客户端
 const notion = new Client({ auth: notionApiKey });
 
-// 状态映射：将技术结果转换为 Notion 中的中文状态
+// 状态映射
 const STATUS_MAP = {
   available: "可用",
   redirect: "重定向",
@@ -18,65 +18,60 @@ const STATUS_MAP = {
 };
 
 /**
- * 检查单个 URL 的有效性 (优化版，带 GET 备用方案)
+ * 使用 Playwright 检查单个 URL 的有效性
+ * @param {import('playwright').Browser} browser - Playwright 浏览器实例
  * @param {string} url - 需要检查的 URL
  * @returns {Promise<string>} - 返回链接的状态
  */
-async function checkUrlStatus(url) {
+async function checkUrlStatus(browser, url) {
   if (!url) {
     return STATUS_MAP.error;
   }
 
-  // 定义通用的请求头，模拟浏览器
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
-  };
-
-  // --- 第一次尝试: 使用高效的 HEAD 请求 ---
+  let page;
   try {
-    const response = await axios.head(url, { timeout: 8000, maxRedirects: 5, headers });
-    if (response.request.res.responseUrl && response.request.res.responseUrl !== url) {
+    // 创建一个新的浏览器页面
+    page = await browser.newPage({
+      // 模拟一个常见的浏览器 User-Agent
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    });
+
+    // 导航到目标 URL，等待页面加载完成
+    // waitUntil: 'domcontentloaded' 是一个很好的平衡点，无需等待所有图片加载
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    
+    const finalUrl = page.url();
+    const status = response.status();
+
+    // 检查是否发生重定向
+    if (finalUrl !== url && finalUrl !== url + '/') {
       return STATUS_MAP.redirect;
     }
-    if (response.status >= 200 && response.status < 300) {
+    
+    // 检查状态码
+    if (status >= 200 && status < 400) { // 2xx 和 3xx 都认为是可访问的
       return STATUS_MAP.available;
+    } else if (status === 404) {
+      return STATUS_MAP.dead;
+    } else {
+      // 其他 4xx 或 5xx 错误
+      return STATUS_MAP.error;
     }
-  } catch (headError) {
-    // 如果 HEAD 请求返回 404，那基本可以确定是死链，无需重试
-    if (headError.response && headError.response.status === 404) {
-      console.log(`ℹ️  HEAD request confirmed 404 Not Found.`);
+
+  } catch (error) {
+    console.error(`🔴 检查 "${url}" 时发生 Playwright 错误: ${error.message}`);
+    // 根据错误信息判断是否为死链
+    if (error.message.includes('404')) {
       return STATUS_MAP.dead;
     }
-    
-    // 对于其他错误 (如 403, 405, 超时等)，我们将降级使用 GET 请求重试
-    console.log(`⚠️  HEAD request failed: ${headError.message}. Retrying with GET...`);
-
-    // --- 第二次尝试: 使用兼容性更好的 GET 请求作为备用方案 ---
-    try {
-      const getResponse = await axios.get(url, { timeout: 15000, maxRedirects: 5, headers });
-      if (getResponse.request.res.responseUrl && getResponse.request.res.responseUrl !== url) {
-        return STATUS_MAP.redirect;
-      }
-      if (getResponse.status >= 200 && getResponse.status < 300) {
-        return STATUS_MAP.available;
-      }
-    } catch (getError) {
-      // 如果 GET 请求也失败了，我们采纳 GET 的失败结果
-      if (getError.response) {
-        console.error(`🔴 GET retry also failed with status ${getError.response.status}.`);
-        return getError.response.status === 404 ? STATUS_MAP.dead : STATUS_MAP.error;
-      }
-      console.error(`🔴 GET retry also failed with network error: ${getError.message}.`);
-      return STATUS_MAP.error; // 网络错误
+    return STATUS_MAP.error;
+  } finally {
+    // 无论成功与否，都关闭页面
+    if (page) {
+      await page.close();
     }
   }
-  
-  // 兜底的错误状态
-  return STATUS_MAP.error;
 }
-
 
 /**
  * 更新 Notion 页面
@@ -89,9 +84,7 @@ async function updateNotionPage(pageId, newStatus) {
       page_id: pageId,
       properties: {
         '状态': {
-          status: {
-            name: newStatus,
-          },
+          status: { name: newStatus },
         },
       },
     });
@@ -105,15 +98,17 @@ async function updateNotionPage(pageId, newStatus) {
  * 主函数
  */
 async function main() {
-  console.log("🚀 开始执行链接检查任务...");
+  console.log("🚀 开始执行链接检查任务 (Playwright 健壮模式)...");
+  
+  // --- 关键优化：只启动一次浏览器 ---
+  const browser = await playwright.chromium.launch();
+  
   try {
     const response = await notion.databases.query({
       database_id: databaseId,
       filter: {
         property: "状态",
-        status: {
-          equals: "未检测",
-        },
+        status: { equals: "未检测" },
       },
     });
 
@@ -132,11 +127,12 @@ async function main() {
 
       console.log(`--- 开始检查: "${title}" (${url}) ---`);
       
-      const status = await checkUrlStatus(url);
+      // 将浏览器实例传递给检查函数
+      const status = await checkUrlStatus(browser, url);
       await updateNotionPage(pageId, status);
 
-      // 在每次检查之间加入短暂延时，避免请求过于频繁
-      await new Promise(resolve => setTimeout(resolve, 500)); 
+      // 短暂延时，行为更像人类
+      await new Promise(resolve => setTimeout(resolve, 1000)); 
     }
     console.log("🎉 所有链接检查完毕！");
 
@@ -146,8 +142,11 @@ async function main() {
     } else {
         console.error("❌ 执行主任务时发生未知错误:", error);
     }
+  } finally {
+    // --- 关键优化：任务结束后关闭浏览器 ---
+    await browser.close();
+    console.log("浏览器已关闭。");
   }
 }
 
-// 运行主函数
 main();
