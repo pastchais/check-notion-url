@@ -18,51 +18,65 @@ const STATUS_MAP = {
 };
 
 /**
- * 检查单个 URL 的有效性
+ * 检查单个 URL 的有效性 (优化版，带 GET 备用方案)
  * @param {string} url - 需要检查的 URL
- * @returns {Promise<string>} - 返回链接的状态 (e.g., '可用', '已失效')
+ * @returns {Promise<string>} - 返回链接的状态
  */
 async function checkUrlStatus(url) {
   if (!url) {
     return STATUS_MAP.error;
   }
-  try {
-    // 使用 HEAD 方法，效率更高，只请求头信息，不下载内容
-    // 设置 10 秒超时和最多 5 次重定向
-    const response = await axios.head(url, {
-      timeout: 10000,
-      maxRedirects: 5,
-      // 伪装成浏览器，避免一些网站的 403 错误
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
 
-    // Axios 会自动处理重定向，最终状态码为 2xx 才算成功
-    // 我们可以通过比较请求的最终 URL 和原始 URL 来判断是否发生了重定向
+  // 定义通用的请求头，模拟浏览器
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+  };
+
+  // --- 第一次尝试: 使用高效的 HEAD 请求 ---
+  try {
+    const response = await axios.head(url, { timeout: 8000, maxRedirects: 5, headers });
     if (response.request.res.responseUrl && response.request.res.responseUrl !== url) {
       return STATUS_MAP.redirect;
     }
-    
-    // 状态码在 200-299 之间都算成功
     if (response.status >= 200 && response.status < 300) {
       return STATUS_MAP.available;
     }
-  } catch (error) {
-    // 如果错误对象中有响应体，说明服务器返回了错误状态码
-    if (error.response) {
-      if (error.response.status === 404) {
-        return STATUS_MAP.dead; // 明确是 404 死链
-      }
-      // 其他如 403, 500 等都归为通用错误
-      return STATUS_MAP.error;
+  } catch (headError) {
+    // 如果 HEAD 请求返回 404，那基本可以确定是死链，无需重试
+    if (headError.response && headError.response.status === 404) {
+      console.log(`ℹ️  HEAD request confirmed 404 Not Found.`);
+      return STATUS_MAP.dead;
     }
-    // 如果没有响应体，通常是网络层面的问题（如 DNS 错误，超时）
-    return STATUS_MAP.error;
+    
+    // 对于其他错误 (如 403, 405, 超时等)，我们将降级使用 GET 请求重试
+    console.log(`⚠️  HEAD request failed: ${headError.message}. Retrying with GET...`);
+
+    // --- 第二次尝试: 使用兼容性更好的 GET 请求作为备用方案 ---
+    try {
+      const getResponse = await axios.get(url, { timeout: 15000, maxRedirects: 5, headers });
+      if (getResponse.request.res.responseUrl && getResponse.request.res.responseUrl !== url) {
+        return STATUS_MAP.redirect;
+      }
+      if (getResponse.status >= 200 && getResponse.status < 300) {
+        return STATUS_MAP.available;
+      }
+    } catch (getError) {
+      // 如果 GET 请求也失败了，我们采纳 GET 的失败结果
+      if (getError.response) {
+        console.error(`🔴 GET retry also failed with status ${getError.response.status}.`);
+        return getError.response.status === 404 ? STATUS_MAP.dead : STATUS_MAP.error;
+      }
+      console.error(`🔴 GET retry also failed with network error: ${getError.message}.`);
+      return STATUS_MAP.error; // 网络错误
+    }
   }
+  
   // 兜底的错误状态
   return STATUS_MAP.error;
 }
+
 
 /**
  * 更新 Notion 页面
@@ -74,8 +88,7 @@ async function updateNotionPage(pageId, newStatus) {
     await notion.pages.update({
       page_id: pageId,
       properties: {
-        '状态': { // 属性名必须与你的 Notion 数据库完全一致
-          // 这里是关键的第二处修改，更新时也需要用 status 关键词
+        '状态': {
           status: {
             name: newStatus,
           },
@@ -84,7 +97,7 @@ async function updateNotionPage(pageId, newStatus) {
     });
     console.log(`✅ [${pageId}] 更新成功，新状态: ${newStatus}`);
   } catch (error) {
-    console.error(`❌ [${pageId}] 更新 Notion 页面失败:`, error.body);
+    console.error(`❌ [${pageId}] 更新 Notion 页面失败:`, error.body || error);
   }
 }
 
@@ -94,13 +107,11 @@ async function updateNotionPage(pageId, newStatus) {
 async function main() {
   console.log("🚀 开始执行链接检查任务...");
   try {
-    // 查询数据库中所有“状态”为“未检测”的页面
     const response = await notion.databases.query({
       database_id: databaseId,
-      // [FIXED] 将 filter 从 select 修改为 status
       filter: {
         property: "状态",
-        status: { // <--- 这里是关键修正！
+        status: {
           equals: "未检测",
         },
       },
@@ -114,7 +125,6 @@ async function main() {
     
     console.log(`🔍 找到 ${pages.length} 个需要检查的链接。`);
 
-    // 遍历所有需要检查的页面
     for (const page of pages) {
       const pageId = page.id;
       const title = page.properties.名称.title[0]?.plain_text || "无标题";
@@ -131,7 +141,6 @@ async function main() {
     console.log("🎉 所有链接检查完毕！");
 
   } catch (error) {
-    // 增加对 API 错误的具体日志输出
     if (error.code) {
         console.error("❌ 执行主任务时发生 Notion API 错误:", error);
     } else {
