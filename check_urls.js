@@ -1,7 +1,8 @@
 // 引入所需的库
 const { Client } = require("@notionhq/client");
 const playwright = require("playwright");
-const pLimit = require("p-limit");
+// [FIXED] 修正 p-limit 的导入方式以兼容 CommonJS
+const { default: pLimit } = require("p-limit");
 
 // 从 GitHub Secrets 获取 Notion API 密钥和数据库 ID
 const notionApiKey = process.env.NOTION_API_KEY;
@@ -65,7 +66,7 @@ async function checkUrlStatus(browser, url) {
 }
 
 /**
- * [REFACTORED] 将检查和更新的完整流程封装成一个函数
+ * 将检查和更新的完整流程封装成一个函数
  * @param {object} pageInfo - Notion 页面对象
  * @param {import('playwright').Browser} browser - Playwright 浏览器实例
  */
@@ -124,16 +125,12 @@ async function main() {
       return;
     }
     
-    console.log(`🔍 共找到 ${allPages.length} 个链接，将以 ${limit.activeCount} 的并发数开始检查。`);
+    console.log(`🔍 共找到 ${allPages.length} 个链接，将以 ${limit.concurrency} 的并发数开始检查。`);
 
-    // --- [OPTIMIZATION] ---
-    // 创建一个包含所有待处理任务的数组
     const promises = allPages.map(page => 
-      // 使用 p-limit 来包装我们的处理函数，从而控制并发
       limit(() => processPage(page, browser))
     );
     
-    // 等待所有并发任务完成
     await Promise.all(promises);
 
     console.log("🎉 所有链接检查完毕！");
