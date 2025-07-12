@@ -12,7 +12,6 @@ on:
 jobs:
   check-links:
     runs-on: ubuntu-latest
-    # 增加超时设置，因为安装和运行 Playwright 可能耗时较长
     timeout-minutes: 15
 
     steps:
@@ -24,22 +23,28 @@ jobs:
         with:
           node-version: '20'
 
-      # 新增：缓存依赖，加快后续运行速度
-      - name: Cache dependencies
-        uses: actions/cache@v3
+      # --- [OPTIMIZATION] ---
+      # 缓存 Playwright 的浏览器二进制文件
+      - name: Cache Playwright browsers
+        id: playwright-cache # 给这个步骤一个 ID，方便后续引用
+        uses: actions/cache@v4
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          # Playwright 在 Linux 系统下的默认缓存路径
+          path: ~/.cache/ms-playwright
+          # 缓存的 key。当 package-lock.json 变化时（意味着 Playwright 版本可能更新），key 会变化，缓存会失效
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package-lock.json') }}
+          # 如果 key 完全匹配不上，会尝试使用这个模糊匹配来恢复一个旧缓存
           restore-keys: |
-            ${{ runner.os }}-node-
+            ${{ runner.os }}-playwright-
 
-      # 修改：使用 npm ci 更快更可靠地安装依赖
       - name: Install dependencies
         run: npm ci
 
-      # 新增：安装 Playwright 所需的浏览器二进制文件
+      # --- [OPTIMIZATION] ---
+      # 只有在没有命中缓存的情况下，才执行安装步骤
       - name: Install Playwright Browsers
-        run: npx playwright install --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium # 只安装我们需要的 chromium 内核
 
       # 运行脚本
       - name: Run link checker script
