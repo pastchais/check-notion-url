@@ -30,43 +30,34 @@ async function checkUrlStatus(browser, url) {
 
   let page;
   try {
-    // 创建一个新的浏览器页面
     page = await browser.newPage({
-      // 模拟一个常见的浏览器 User-Agent
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     });
 
-    // 导航到目标 URL，等待页面加载完成
-    // waitUntil: 'domcontentloaded' 是一个很好的平衡点，无需等待所有图片加载
     const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     
     const finalUrl = page.url();
     const status = response.status();
 
-    // 检查是否发生重定向
     if (finalUrl !== url && finalUrl !== url + '/') {
       return STATUS_MAP.redirect;
     }
     
-    // 检查状态码
-    if (status >= 200 && status < 400) { // 2xx 和 3xx 都认为是可访问的
+    if (status >= 200 && status < 400) {
       return STATUS_MAP.available;
     } else if (status === 404) {
       return STATUS_MAP.dead;
     } else {
-      // 其他 4xx 或 5xx 错误
       return STATUS_MAP.error;
     }
 
   } catch (error) {
     console.error(`🔴 检查 "${url}" 时发生 Playwright 错误: ${error.message}`);
-    // 根据错误信息判断是否为死链
     if (error.message.includes('404')) {
       return STATUS_MAP.dead;
     }
     return STATUS_MAP.error;
   } finally {
-    // 无论成功与否，都关闭页面
     if (page) {
       await page.close();
     }
@@ -98,40 +89,53 @@ async function updateNotionPage(pageId, newStatus) {
  * 主函数
  */
 async function main() {
-  console.log("🚀 开始执行链接检查任务 (Playwright 健壮模式)...");
+  console.log("🚀 开始执行链接检查任务 (Playwright 健壮模式 - 全面检查)...");
   
-  // --- 关键优化：只启动一次浏览器 ---
   const browser = await playwright.chromium.launch();
   
   try {
-    const response = await notion.databases.query({
-      database_id: databaseId,
-      filter: {
-        property: "状态",
-        status: { equals: "未检测" },
-      },
-    });
+    // --- [MODIFIED] ---
+    // 通过循环和分页，获取数据库中的所有页面，而不再进行过滤
+    let allPages = [];
+    let nextCursor = undefined;
+    
+    console.log("正在获取数据库中的所有链接...");
 
-    const pages = response.results;
-    if (pages.length === 0) {
-      console.log("👍 没有找到需要检查的链接，任务完成。");
+    do {
+      const response = await notion.databases.query({
+        database_id: databaseId,
+        start_cursor: nextCursor, // 使用 start_cursor 进行分页
+      });
+
+      allPages.push(...response.results);
+      nextCursor = response.next_cursor;
+
+    } while (nextCursor); // 如果还有下一页，则继续循环
+
+    if (allPages.length === 0) {
+      console.log("👍 数据库中没有找到任何链接，任务完成。");
+      await browser.close();
       return;
     }
     
-    console.log(`🔍 找到 ${pages.length} 个需要检查的链接。`);
+    console.log(`🔍 共找到 ${allPages.length} 个链接进行全面检查。`);
 
-    for (const page of pages) {
+    for (const page of allPages) {
       const pageId = page.id;
       const title = page.properties.名称.title[0]?.plain_text || "无标题";
       const url = page.properties.链接.url;
 
+      // 如果链接为空，则跳过检查
+      if (!url) {
+        console.log(`⏭️  跳过: "${title}"，因为链接为空。`);
+        continue;
+      }
+
       console.log(`--- 开始检查: "${title}" (${url}) ---`);
       
-      // 将浏览器实例传递给检查函数
       const status = await checkUrlStatus(browser, url);
       await updateNotionPage(pageId, status);
 
-      // 短暂延时，行为更像人类
       await new Promise(resolve => setTimeout(resolve, 1000)); 
     }
     console.log("🎉 所有链接检查完毕！");
@@ -143,7 +147,6 @@ async function main() {
         console.error("❌ 执行主任务时发生未知错误:", error);
     }
   } finally {
-    // --- 关键优化：任务结束后关闭浏览器 ---
     await browser.close();
     console.log("浏览器已关闭。");
   }
