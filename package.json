@@ -1,0 +1,13 @@
+{
+  "name": "notion-url-checker",
+  "version": "1.0.0",
+  "description": "Checks URLs in a Notion database",
+  "main": "check_urls.js",
+  "scripts": {
+    "start": "node check_urls.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "playwright": "^1.44.1"
+  }
+}
