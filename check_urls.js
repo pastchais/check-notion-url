@@ -82,7 +82,7 @@ async function processPage(pageInfo, browser) {
 
   console.log(`--- 开始检查: "${title}" (${url}) ---`);
   const status = await checkUrlStatus(browser, url);
-  
+
   // 更新 Notion 数据库
   try {
     await notion.pages.update({
@@ -100,14 +100,36 @@ async function processPage(pageInfo, browser) {
 }
 
 /**
+ * [NEW] 删除 (存档) 一个 Notion 页面
+ * @param {object} pageInfo - 要删除的 Notion 页面对象
+ */
+async function deletePage(pageInfo) {
+    const pageId = pageInfo.id;
+    const title = pageInfo.properties.名称.title[0]?.plain_text || "无标题";
+    const url = pageInfo.properties.链接.url;
+
+    console.log(`🗑️  准备删除重复页面: "${title}" (${url})`);
+    try {
+        await notion.pages.update({
+            page_id: pageId,
+            archived: true, // 存档页面即为删除
+        });
+        console.log(`✅ [${title}] 重复页面已成功删除。`);
+    } catch (error) {
+        console.error(`❌ [${title}] 删除 Notion 页面失败:`, error.body || error);
+    }
+}
+
+
+/**
  * 主函数
  */
 async function main() {
-  console.log("🚀 开始执行链接检查任务 (Playwright 并行模式)...");
-  
-  const browser = await playwright.chromium.launch();
-  
+  console.log("🚀 开始执行链接维护任务 (包含重复检查和状态更新)...");
+
+  let browser;
   try {
+    // --- 1. 获取所有页面 ---
     let allPages = [];
     let nextCursor = undefined;
     console.log("正在获取数据库中的所有链接...");
@@ -124,16 +146,62 @@ async function main() {
       console.log("👍 数据库中没有找到任何链接，任务完成。");
       return;
     }
-    
-    console.log(`🔍 共找到 ${allPages.length} 个链接，将以 ${limit.concurrency} 的并发数开始检查。`);
+    console.log(`🔍 共找到 ${allPages.length} 个页面。`);
 
-    const promises = allPages.map(page => 
-      limit(() => processPage(page, browser))
-    );
-    
-    await Promise.all(promises);
 
-    console.log("🎉 所有链接检查完毕！");
+    // --- 2. 检查并处理重复项 ---
+    console.log("\n🧐 开始检查重复链接...");
+    const urlMap = new Map();
+    allPages.forEach(page => {
+        const url = page.properties.链接.url;
+        if (url) { // 只处理有链接的页面
+            if (!urlMap.has(url)) {
+                urlMap.set(url, []);
+            }
+            urlMap.get(url).push(page);
+        }
+    });
+
+    const pagesToDelete = [];
+    const uniquePagesToProcess = [];
+
+    for (const [url, pages] of urlMap.entries()) {
+        if (pages.length > 1) {
+            console.log(`⚠️ 发现重复链接: "${url}" (${pages.length} 次)`);
+            // 保留第一个，将其余的加入删除列表
+            uniquePagesToProcess.push(pages[0]);
+            pagesToDelete.push(...pages.slice(1));
+        } else {
+            // 没有重复的，直接加入处理列表
+            uniquePagesToProcess.push(pages[0]);
+        }
+    }
+
+    if (pagesToDelete.length > 0) {
+        console.log(`\n🗑️ 将删除 ${pagesToDelete.length} 个重复页面...`);
+        const deletePromises = pagesToDelete.map(page =>
+            limit(() => deletePage(page))
+        );
+        await Promise.all(deletePromises);
+        console.log("✅ 所有重复页面处理完毕。");
+    } else {
+        console.log("👍 没有发现重复链接。");
+    }
+    
+
+    // --- 3. 检查剩余唯一链接的状态 ---
+    console.log(`\n🔍 将以 ${limit.concurrency} 的并发数开始检查 ${uniquePagesToProcess.length} 个唯一链接的状态。`);
+    
+    // 仅在需要检查链接时才启动浏览器
+    if (uniquePagesToProcess.length > 0) {
+        browser = await playwright.chromium.launch();
+        const checkPromises = uniquePagesToProcess.map(page =>
+          limit(() => processPage(page, browser))
+        );
+        await Promise.all(checkPromises);
+    }
+
+    console.log("\n🎉 所有任务执行完毕！");
 
   } catch (error) {
     if (error.code) {
@@ -142,8 +210,10 @@ async function main() {
         console.error("❌ 执行主任务时发生未知错误:", error);
     }
   } finally {
-    await browser.close();
-    console.log("浏览器已关闭。");
+    if (browser) {
+        await browser.close();
+        console.log("浏览器已关闭。");
+    }
   }
 }
 
