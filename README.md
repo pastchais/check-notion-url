@@ -1,2 +1,2 @@
-# testNotionUrl
-testNotionUrl
+# checkNotionUrl
+checkNotionUrl
